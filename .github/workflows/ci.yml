@@ -154,10 +154,19 @@ jobs:
           grep -q 'pg-cdc' <<<"$healthcheck"
           grep -q 'health' <<<"$healthcheck"
 
+  check:
+    if: always()
+    needs: [lint, test, pg-matrix, coverage, chaos-smoke, fuzz-smoke, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
+
   image-push:
     name: image push (${{ matrix.arch }})
     if: github.event_name == 'push'
-    needs: [lint, test, pg-matrix, coverage, chaos-smoke, fuzz-smoke, image]
+    needs: check
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
