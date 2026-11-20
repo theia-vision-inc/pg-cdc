@@ -214,6 +214,7 @@ async fn an_active_session_publishes_its_status_and_operator_and_a_standby_publi
 
     pg.execute("INSERT INTO orders VALUES (1, 'poison')")
         .await?;
+    a.wait_for_failures(1).await?;
     pg.execute("UPDATE orders SET status = 'next' WHERE id = 1")
         .await?;
     pg.execute("INSERT INTO orders VALUES (2, 'ok')").await?;

@@ -144,6 +144,7 @@ async fn a_rejected_event_is_parked_dead_and_blocks_only_its_key() -> TestResult
     session.set_mode(Mode::RejectContaining("poison".to_owned()));
     pg.execute("INSERT INTO orders VALUES (1, 'poison')")
         .await?;
+    session.wait_for_failures(1).await?;
     pg.execute("UPDATE orders SET status = 'later' WHERE id = 1")
         .await?;
     pg.execute("INSERT INTO orders VALUES (2, 'fine')").await?;

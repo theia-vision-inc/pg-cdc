@@ -56,7 +56,7 @@ async fn redrive_marks_a_dead_head_retrying_and_delivers_it_then_the_queue() {
             (2, ParkStatus::Retrying)
         ]
     );
-    assert_eq!(harness.sink.batches(), vec![vec![0]]);
+    assert_eq!(harness.sink.batches(), vec![vec![0, 1, 2]]);
     assert_eq!(harness.gauges().dead, 1);
 
     assert_eq!(harness.operator().redrive(k()).await, Ok(id(0)));
@@ -68,13 +68,10 @@ async fn redrive_marks_a_dead_head_retrying_and_delivers_it_then_the_queue() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(harness.store.queue(b"k").await, vec![]);
     assert_eq!(harness.gauges().dead, 0);
-    let order: Vec<u32> = harness
-        .sink
-        .sends()
-        .iter()
-        .map(|sent| sent.ordinal)
-        .collect();
-    assert_eq!(order, vec![0, 0, 1, 2]);
+    assert_eq!(
+        harness.sink.batches(),
+        vec![vec![0, 1, 2], vec![0], vec![1], vec![2]]
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -172,13 +169,46 @@ async fn discard_removes_the_head_only_if_it_still_has_that_id() {
         .iter()
         .map(|sent| sent.ordinal)
         .collect();
-    assert_eq!(order, vec![0, 1]);
+    assert_eq!(order, vec![0, 1, 1]);
 
     let appended = harness.store.appends.load(Ordering::SeqCst);
     harness.send(2, b"k", 10).unwrap();
     harness.settle(1).await;
     assert_eq!(harness.delivered(2).await, vec![1, 2]);
     assert_eq!(harness.store.appends.load(Ordering::SeqCst), appended);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_event_the_sink_took_behind_a_rejected_one_in_its_run_is_sent_again_after_a_discard() {
+    let script: Script = Box::new(|ordinal, _| {
+        if ordinal == 1 {
+            Outcome::Terminal(SinkError("rejected".to_owned()))
+        } else {
+            Outcome::Delivered
+        }
+    });
+    let mut harness = Harness::new(1, 1, ScriptedSink::new(LIMITS, script)).await;
+    for ordinal in 0..3 {
+        harness.send(ordinal, b"k", 10).unwrap();
+    }
+    assert_eq!(harness.settle(3).await, Lsn(102));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        harness.store.queue(b"k").await,
+        vec![(1, ParkStatus::Dead), (2, ParkStatus::Retrying)]
+    );
+    assert_eq!(harness.operator().discard(k(), id(1)).await, Ok(id(1)));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(harness.store.queue(b"k").await, vec![]);
+    assert_eq!(harness.sink.batches(), vec![vec![0, 1, 2], vec![2]]);
+    let delivered: Vec<(u32, bool)> = harness
+        .sink
+        .sends()
+        .iter()
+        .map(|sent| (sent.ordinal, sent.delivered))
+        .collect();
+    assert_eq!(delivered, vec![(0, true), (1, false), (2, true), (2, true)]);
+    assert_eq!(harness.sink.accepted(), vec![0, 2]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -316,14 +346,7 @@ async fn a_discard_leaves_no_stale_retry_to_ready_the_key_twice() {
         harness.send(ordinal, b"k", 10).unwrap();
     }
     harness.settle(60).await;
-    let delivered: Vec<u32> = harness
-        .sink
-        .sends()
-        .iter()
-        .filter(|sent| sent.delivered)
-        .map(|sent| sent.ordinal)
-        .collect();
-    assert_eq!(delivered, (1..=60).collect::<Vec<u32>>());
+    assert_eq!(harness.sink.accepted(), (1..=60).collect::<Vec<u32>>());
 }
 
 #[tokio::test(start_paused = true)]

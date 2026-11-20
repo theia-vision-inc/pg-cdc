@@ -196,12 +196,24 @@ impl Batcher {
             if count == limits.max_batch_messages
                 || (count > 0 && bytes.saturating_add(queued.bytes) > limits.max_batch_bytes)
             {
-                return (count, true);
+                return (self.run_start(count), true);
             }
             count += 1;
             bytes = bytes.saturating_add(queued.bytes);
         }
         (count, count >= limits.max_batch_messages)
+    }
+
+    fn run_start(&self, cut: usize) -> usize {
+        let Some(key) = self.queue.get(cut).map(|queued| queued.outbound.order_key) else {
+            return cut;
+        };
+        let start = self
+            .queue
+            .range(..cut)
+            .rposition(|queued| queued.outbound.order_key != key)
+            .map_or(0, |last| last + 1);
+        if start == 0 { cut } else { start }
     }
 
     fn take(&mut self, count: usize) -> (Vec<Outbound>, Vec<Slot>) {

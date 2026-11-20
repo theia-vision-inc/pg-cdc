@@ -386,7 +386,11 @@ async fn an_oversized_parked_head_counts_one_terminal_error() {
 #[tokio::test(start_paused = true)]
 async fn each_sink_call_records_one_point_timed_over_the_call() {
     let seen = recording();
-    let mut sink = ScriptedSink::delivering();
+    let limits = SinkCapabilities {
+        max_batch_messages: 2,
+        ..LIMITS
+    };
+    let mut sink = ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered));
     sink.latency = Duration::from_millis(30);
     let mut harness = Harness::new(1, 1, sink).await;
     for (ordinal, key) in [(0, b"a"), (1, b"a"), (2, b"b")] {

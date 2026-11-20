@@ -59,13 +59,8 @@ async fn a_key_failing_for_park_after_parks_its_events_and_settles_them() {
         summary[1],
         (1, ParkStatus::Retrying, 0, "queued behind a parked event")
     );
-    let sent: Vec<u32> = harness
-        .sink
-        .sends()
-        .iter()
-        .map(|sent| sent.ordinal)
-        .collect();
-    assert!(!sent.contains(&1), "{sent:?}");
+    let accepted = harness.sink.accepted();
+    assert!(!accepted.contains(&1), "{accepted:?}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -101,7 +96,7 @@ async fn a_terminal_outcome_parks_the_event_dead_and_blocks_its_key() {
     harness.send(2, b"healthy", 10).unwrap();
     assert_eq!(harness.settle(3).await, Lsn(102));
     assert!(harness.quiet_for(Duration::from_secs(600)).await);
-    assert_eq!(harness.sink.batches(), vec![vec![0, 2]]);
+    assert_eq!(harness.sink.batches(), vec![vec![0, 1, 2]]);
     assert_eq!(
         harness.store.queue(b"poison").await,
         vec![(0, ParkStatus::Dead), (1, ParkStatus::Retrying)]
@@ -109,7 +104,7 @@ async fn a_terminal_outcome_parks_the_event_dead_and_blocks_its_key() {
     harness.send(3, b"poison", 10).unwrap();
     assert_eq!(harness.settle(1).await, Lsn(103));
     assert_eq!(harness.store.queue(b"poison").await.len(), 3);
-    assert_eq!(harness.sink.batches(), vec![vec![0, 2]]);
+    assert_eq!(harness.sink.batches(), vec![vec![0, 1, 2]]);
     let stored = harness
         .store
         .inner
@@ -133,6 +128,53 @@ async fn a_terminal_outcome_parks_the_event_dead_and_blocks_its_key() {
             (1, 0, "queued behind a parked event"),
             (3, 0, "queued behind a parked event"),
         ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_terminal_outcome_inside_a_run_parks_the_key_dead_from_that_event() {
+    let script: Script = Box::new(|ordinal, _| {
+        if ordinal == 1 {
+            Outcome::Terminal(SinkError("rejected".to_owned()))
+        } else {
+            Outcome::Delivered
+        }
+    });
+    let mut harness = Harness::new(1, 1, ScriptedSink::new(LIMITS, script)).await;
+    for ordinal in 0..3 {
+        harness.send(ordinal, b"poison", 10).unwrap();
+    }
+    assert_eq!(harness.settle(3).await, Lsn(102));
+    assert!(harness.quiet_for(Duration::from_secs(600)).await);
+    assert_eq!(harness.sink.batches(), vec![vec![0, 1, 2]]);
+    assert_eq!(
+        harness.store.queue(b"poison").await,
+        vec![(1, ParkStatus::Dead), (2, ParkStatus::Retrying)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_stops_before_an_event_above_the_sink_limit_which_then_parks_dead() {
+    let limits = SinkCapabilities {
+        max_message_bytes: 100,
+        ..LIMITS
+    };
+    let mut harness = Harness::new(
+        1,
+        1,
+        ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered)),
+    )
+    .await;
+    harness.send(0, b"k", 10).unwrap();
+    harness.send(1, b"k", 10).unwrap();
+    harness.send(2, b"k", 101).unwrap();
+    harness.send(3, b"k", 10).unwrap();
+    assert_eq!(harness.settle(4).await, Lsn(103));
+    assert!(harness.quiet_for(Duration::from_secs(60)).await);
+    assert_eq!(harness.sink.batches(), vec![vec![0, 1]]);
+    assert_eq!(
+        harness.store.queue(b"k").await,
+        vec![(2, ParkStatus::Dead), (3, ParkStatus::Retrying)]
     );
 }
 
@@ -286,14 +328,7 @@ async fn an_append_that_lands_only_part_of_a_queue_delivers_each_event_once_in_o
     }
     assert_eq!(harness.settle(3).await, Lsn(102));
     assert!(harness.quiet_for(Duration::from_secs(120)).await);
-    let delivered: Vec<u32> = harness
-        .sink
-        .sends()
-        .iter()
-        .filter(|sent| sent.delivered)
-        .map(|sent| sent.ordinal)
-        .collect();
-    assert_eq!(delivered, vec![0, 1, 2]);
+    assert_eq!(harness.sink.accepted(), vec![0, 1, 2]);
     assert_eq!(harness.store.queue(b"k").await, vec![]);
 }
 

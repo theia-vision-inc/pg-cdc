@@ -41,6 +41,35 @@ async fn an_oversize_event_is_sent_as_a_pointer_to_its_stored_payload() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_run_stops_before_an_oversize_event_which_goes_alone_as_a_pointer() {
+    let payloads = Arc::new(TestPayloads::default());
+    let mut harness = Harness::start_with_payloads(
+        Setup::default(),
+        limited(300),
+        TestStore::default(),
+        Some(Arc::clone(&payloads)),
+    )
+    .await;
+    let full = envelope(2, 400);
+    harness.send(0, b"k", 10).unwrap();
+    harness.send(1, b"k", 10).unwrap();
+    harness.send_body(2, b"k", full.clone()).unwrap();
+    harness.send(3, b"k", 10).unwrap();
+    harness.send(4, b"k", 10).unwrap();
+    assert_eq!(harness.settle(5).await, Lsn(104));
+    assert_eq!(
+        harness.sink.batches(),
+        vec![vec![0, 1], vec![2], vec![3, 4]]
+    );
+    let bodies = harness.sink.bodies.lock().unwrap().clone();
+    assert_eq!(
+        std::str::from_utf8(&bodies[&2]).unwrap(),
+        pointer(2, full.len())
+    );
+    assert_eq!(harness.store.inner.parked_events(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_event_pushed_over_the_limit_by_changed_becomes_a_pointer_that_keeps_it() {
     let mut update = crate::event::sample_envelope(
         crate::event::Op::Update,

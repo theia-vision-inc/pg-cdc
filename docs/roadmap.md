@@ -27,7 +27,8 @@ Not planned without evidence: streaming of in-progress transactions, exactly-onc
 
 These follow from the design and have no planned change.
 
-- **A hot key's throughput.** One order key moves at most one event per sink round trip, roughly 20 to 50 events/s against SNS. `delivery.order_by` and `delivery.order_by_tables` choose the key.
+- **A hot key's throughput.** One order key moves at most one batch per sink round trip, up to 10 events and roughly 200 to 500 events/s against SNS, and one event per round trip while parked. `delivery.order_by` and `delivery.order_by_tables` choose the key.
+- **A failed entry in an SNS batch can let that key's later events in the same batch arrive first.** SNS does not hold back a group's later entries when one fails, and pg-cdc sends those it already accepted again after the failed one, so they can also arrive twice. The FIFO deduplication id suppresses that within SNS's 5-minute window; otherwise consumers dedupe on `id`, as for any at-least-once delivery.
 - **A lane waits for its store calls.** Parking, head loading, removals and admin operations run inside the lane that owns the key, so while one waits on the state store the lane sends nothing, for its healthy keys too. Other lanes keep flowing.
 - **Parked keys cost memory** outside `max_inflight_bytes`, about 0.5 to 1 KB each, bounded by `delivery.max_parked_events` ([runbook](runbook.md#5-parked-and-dead-events)).
 - **A paused process** longer than `fence_delay` can cause duplicates and, rarely, one key's events out of order, never loss.
