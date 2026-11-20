@@ -279,7 +279,7 @@ The xid is left out of the envelope: it is 32 bits and wraps, and `commit_lsn` a
 | `key` (default) | schema, table and key values; schema and table when the relation has no key |
 | `table` | schema and table |
 | `column:<name>` | the value of that column; schema and table when the column is absent or null |
-| `pipeline` | one constant key: total order, with one event in flight at a time |
+| `pipeline` | one constant key: total order, with one sink call in flight at a time and the per-key exception in §8 |
 
 - **Per-table overrides.** `delivery.order_by_tables` maps `schema.table` to `key`, `table` or `column:<name>` (not `pipeline`); other tables use `delivery.order_by`.
   - The effective mode is resolved once per Relation message and cached with the relation, so events never look it up by name.
@@ -311,10 +311,11 @@ When the encoded message (body plus attributes) exceeds the sink's `max_message_
 
 - **Lane assignment.** There are `delivery.lanes` tasks (default 64), and an event goes to lane `order_key_id mod lanes`.
 - **Lanes own their keys.** A lane holds the per-key queues, retry timers, parked state and batching for its order keys, so per-key state needs no locks.
-- **One event per key in flight.** At most one event per order key is in flight, and a batch holds at most one event per order key.
+- **One batch per key in flight.** At most one sink call per order key is in flight. A key's consecutive queued events share that call, up to the sink's message and byte limits, and the batcher never splits them across calls. A parked key, or a key whose head is an oversize pointer, sends one event per call.
+- **A failure inside a key's run.** The lane settles the key's events up to the first one not delivered and resends the rest, in order, from that event. SNS publishes a batch's entries in order but does not hold back a group's later entries when one fails, so those later events can reach consumers before the failed one's retry, a rare per-key reorder, and since they are sent again they can also arrive twice. The FIFO deduplication id suppresses the second copy within SNS's 5-minute window; otherwise consumers dedupe on `id`, as for any at-least-once delivery.
 - **Batching.** Batches are filled from ready keys up to the sink's message and byte limits, lingering up to 5 ms when not full.
 - **Retries don't block the lane.** A key whose head is waiting on a retry is not ready, and the lane's other keys keep flowing. Store calls do block it: parking, head loading, removals and admin operations run inside the lane, so the lane sends nothing while it waits on the store (a v1 limit).
-- **Per-key throughput.** One key moves at most one event per sink round trip, roughly 20–50 events/s for SNS. `order_by: pipeline` therefore trades throughput for total order.
+- **Per-key throughput.** One key moves at most one batch per sink round trip, up to 10 events for SNS, roughly 200–500 events/s, within SNS FIFO's per-group limit (§11.2). `order_by: pipeline` therefore trades throughput for total order.
 
 ## 9. Delivery and acknowledgement
 
@@ -460,7 +461,7 @@ v1 sinks:
   - the topic must exist;
   - `FifoTopic` selects FIFO mode;
   - `MaximumMessageSize` sets `max_message_bytes` and `max_batch_bytes`. It is 256 KiB unless the topic opts in to up to 1 MiB.
-- **Size accounting** follows SNS rules: the body plus attribute names, types and values. If SNS still rejects a batch as too long, the sink sends its entries one at a time and reports per-entry outcomes.
+- **Size accounting** follows SNS rules: the body plus attribute names, types and values. If SNS still rejects a batch as too long, the sink sends its entries one at a time and reports per-entry outcomes; once an entry is not delivered, the later entries of its order key in that batch are not sent and are `Retryable`.
 - **Outcomes:**
   - a failed entry with `SenderFault=true` is `Terminal`;
   - a failed entry with `SenderFault=false` is `Retryable`;
@@ -711,7 +712,7 @@ Each invariant has an enforcement mechanism listed in §14.6. A runtime violatio
 ### 14.2 Identity and order
 
 - **O1. Ids depend only on the WAL.** The same WAL yields the same ids on every replay, strictly increasing in stream order.
-- **O2. Each key is delivered in order.** Events of one order key reach the sink in id order, and the next is sent only after the previous is delivered or discarded.
+- **O2. Each key is delivered in order.** Events of one order key reach the sink in id order. A call carries a key's events as one consecutive run, and the key's next call starts at its earliest event not yet delivered or discarded. The one exception is a per-entry failure inside an SNS batch, which can let that key's later events in the batch arrive first (§8).
 - **O3. Parked keys stay queued.** While an order key has parked events, its new events are appended behind them. The key returns to the live path only once the store confirms the queue is empty.
 
 ### 14.3 Acknowledgement
@@ -1078,7 +1079,7 @@ Also in v1.1, outside the ranking: an optional `pprof` build feature for CPU pro
 | Fencing assumes no process pauses for longer than `fence_delay` | Only duplicates result; documented |
 | Parking during a long outage costs about $5.40 per million events on S3: a PUT to park and a GET to drain each event, plus batched deletes and a listing per 1,000 events | `max_parked_events`; a segmented layout in v1.1 if needed |
 | Primary keys are read from the current catalog, not as of the WAL position | A key change during traffic can mis-key a few events; documented |
-| A hot key moves at most one event per sink round trip; while its parked queue drains, each event also costs a GET and its share of a batched delete, with a listing per 1,000 events (§11.4) | Documented, along with the `order_by` choices; parked drain across keys is bounded by `state_store.max_concurrency` (§15) |
+| A hot key moves at most one batch per sink round trip, and while parked one event; while its parked queue drains, each event also costs a GET and its share of a batched delete, with a listing per 1,000 events (§11.4) | Documented, along with the `order_by` choices; parked drain across keys is bounded by `state_store.max_concurrency` (§15) |
 | Changing a publication during a backlog can renumber replayed ordinals | Change publications only when caught up (§7.2) |
 
 ## 22. References

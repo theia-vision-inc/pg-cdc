@@ -356,9 +356,9 @@ impl Lane {
                 self.offload().await;
                 continue;
             }
-            let count = self.plan_batch();
-            if count > 0 {
-                self.send_batch(count).await;
+            let runs = self.plan_batch();
+            if runs.iter().any(|run| *run > 0) {
+                self.send_batch(runs).await;
                 continue;
             }
             if stored {
@@ -536,24 +536,49 @@ impl Lane {
         }
     }
 
-    fn plan_batch(&self) -> usize {
+    fn sendable(&self, key: &OrderKeyId) -> impl Iterator<Item = &Outbound> {
+        let live = self
+            .keys
+            .get(key)
+            .filter(|state| state.stored.is_none() && state.offloaded.is_none());
+        let following = live
+            .into_iter()
+            .flat_map(|state| state.queue.iter().skip(1).map(|pending| &pending.outbound));
+        self.front(key).into_iter().chain(following)
+    }
+
+    fn plan_batch(&self) -> Vec<usize> {
         let limits = self.capabilities;
+        let mut runs = Vec::new();
         let mut count = 0;
         let mut bytes = 0_usize;
         for key in &self.ready {
-            let Some(head) = self.front(key) else {
-                continue;
-            };
-            let size = head.encoded_len();
-            if count == limits.max_batch_messages
-                || (count > 0 && bytes.saturating_add(size) > limits.max_batch_bytes)
-            {
+            let mut run = 0;
+            let mut full = false;
+            for outbound in self.sendable(key) {
+                let size = outbound.encoded_len();
+                if run > 0 && size > limits.max_message_bytes {
+                    break;
+                }
+                if count == limits.max_batch_messages
+                    || (count > 0 && bytes.saturating_add(size) > limits.max_batch_bytes)
+                {
+                    full = true;
+                    break;
+                }
+                run += 1;
+                count += 1;
+                bytes = bytes.saturating_add(size);
+            }
+            if full && run == 0 {
                 break;
             }
-            count += 1;
-            bytes = bytes.saturating_add(size);
+            runs.push(run);
+            if full {
+                break;
+            }
         }
-        count
+        runs
     }
 
     async fn wait(&mut self, until: Option<Instant>) -> bool {
@@ -572,13 +597,15 @@ impl Lane {
         }
     }
 
-    async fn send_batch(&mut self, count: usize) {
-        let mut keys = Vec::with_capacity(count);
-        let mut batch = Vec::with_capacity(count);
-        for key in self.ready.drain(..count).collect::<Vec<_>>() {
-            if let Some(head) = self.front(&key) {
-                batch.push(head.clone());
-                keys.push(key);
+    async fn send_batch(&mut self, runs: Vec<usize>) {
+        let keys: Vec<OrderKeyId> = self.ready.drain(..runs.len()).collect();
+        let mut planned = Vec::with_capacity(keys.len());
+        let mut batch = Vec::new();
+        for (key, run) in keys.into_iter().zip(runs) {
+            let start = batch.len();
+            batch.extend(self.sendable(&key).take(run).cloned());
+            if batch.len() > start {
+                planned.push((key, batch.len() - start));
             }
         }
         let sink = Arc::clone(&self.sink);
@@ -590,47 +617,58 @@ impl Lane {
                 "the sink broke its contract of one outcome per message"
             );
         }
-        outcomes.resize_with(keys.len(), || {
+        outcomes.resize_with(batch.len(), || {
             Outcome::Retryable(SinkError("the sink returned no outcome".to_owned()))
         });
-        for (key, outcome) in keys.into_iter().zip(&outcomes) {
-            self.complete(key, outcome);
+        let mut rest = outcomes.as_slice();
+        for (key, run) in planned {
+            let (outcomes, after) = rest.split_at(run);
+            rest = after;
+            self.complete(key, outcomes);
         }
     }
 
-    fn complete(&mut self, key: OrderKeyId, outcome: &Outcome) {
+    fn complete(&mut self, key: OrderKeyId, outcomes: &[Outcome]) {
         let Some(state) = self.keys.get_mut(&key) else {
             return;
         };
         if state.stored.is_some() {
-            self.complete_stored(key, outcome);
+            if let Some(outcome) = outcomes.first() {
+                self.complete_stored(key, outcome);
+            }
             return;
         }
-        match outcome {
-            Outcome::Delivered => {
-                state.offloaded = None;
-                let Some(head) = state.queue.pop_front() else {
-                    return;
-                };
-                record_delivered(&head.outbound, head.committed_ms);
-                if let Ok(settled) = head.ticket.settle(outcome) {
-                    let _ = self.reports.send(Report::Settled(settled));
-                }
-                if state.queue.is_empty() {
-                    self.keys.remove(&key);
-                } else {
+        for outcome in outcomes {
+            match outcome {
+                Outcome::Delivered => {
+                    state.offloaded = None;
+                    let Some(head) = state.queue.pop_front() else {
+                        return;
+                    };
+                    record_delivered(&head.outbound, head.committed_ms);
+                    if let Ok(settled) = head.ticket.settle(outcome) {
+                        let _ = self.reports.send(Report::Settled(settled));
+                    }
                     state.backoff.reset();
                     state.failure = None;
-                    self.make_ready(key);
+                }
+                Outcome::Retryable(error) => {
+                    self.retry_live(key, error);
+                    return;
+                }
+                Outcome::Terminal(error) => {
+                    let id = state.queue.front().map(|head| head.outbound.id);
+                    tracing::error!(order_key = %key, ?id, %error, "the sink rejected the event for good; parking it dead");
+                    state.record_failure(error);
+                    self.start_parking(key, true);
+                    return;
                 }
             }
-            Outcome::Retryable(error) => self.retry_live(key, error),
-            Outcome::Terminal(error) => {
-                let id = state.queue.front().map(|head| head.outbound.id);
-                tracing::error!(order_key = %key, ?id, %error, "the sink rejected the event for good; parking it dead");
-                state.record_failure(error);
-                self.start_parking(key, true);
-            }
+        }
+        if state.queue.is_empty() {
+            self.keys.remove(&key);
+        } else {
+            self.make_ready(key);
         }
     }
 }

@@ -117,16 +117,16 @@ Fixed internal values: standby poll and lease check every 2 s; sink batch linger
 
 ## Order keys
 
-The order key decides ordering and lane placement. Events of one order key are delivered one at a time, in stream order.
+The order key decides ordering and lane placement. Events of one order key are delivered in stream order, with at most one sink call per key in flight.
 
 | `delivery.order_by` | Order key |
 |---|---|
 | `key` | schema, table and key values (primary key or replica identity index); schema and table when the relation has no key |
 | `table` | schema and table |
 | `column:<name>` | the value of that column; schema and table when it is absent or null |
-| `pipeline` | one key for everything: total order, one event in flight at a time |
+| `pipeline` | one key for everything: total order, one sink call in flight at a time, with the per-key exception for a failed SNS batch entry ([roadmap](roadmap.md#known-constraints)) |
 
-A truncate has no key: its order key is its table under `key`, `table` and the `column:<name>` fallback, and the one constant key under `pipeline`. Under `key` and `column:<name>` it is therefore not ordered relative to that table's row events that use a different order key. One order key moves at most one event per sink round trip plus up to the batch linger, roughly 20 to 50 events/s against SNS, so choose `order_by` so that no single key carries a high rate.
+A truncate has no key: its order key is its table under `key`, `table` and the `column:<name>` fallback, and the one constant key under `pipeline`. Under `key` and `column:<name>` it is therefore not ordered relative to that table's row events that use a different order key. One order key moves at most one batch per sink round trip plus up to the batch linger, up to 10 events and roughly 200 to 500 events/s against SNS, so choose `order_by` so that no single key carries a high rate.
 
 `delivery.order_by_tables` overrides `order_by` for the tables it names; every other table keeps `order_by`:
 

@@ -38,6 +38,7 @@ const LIMITS: SinkCapabilities = SinkCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Sent {
     ordinal: u32,
+    key: OrderKeyId,
     at: Instant,
     delivered: bool,
 }
@@ -91,6 +92,10 @@ impl ScriptedSink {
     fn sends(&self) -> Vec<Sent> {
         self.batches.lock().unwrap().concat()
     }
+
+    fn accepted(&self) -> Vec<u32> {
+        accepted(&self.batches.lock().unwrap())
+    }
 }
 
 #[async_trait]
@@ -126,6 +131,7 @@ impl Sink for ScriptedSink {
                 .insert(ordinal, outbound.body.clone());
             sent.push(Sent {
                 ordinal,
+                key: outbound.order_key,
                 at,
                 delivered: outcome == Outcome::Delivered,
             });
@@ -519,13 +525,7 @@ impl Harness {
 
     async fn delivered(&self, count: usize) -> Vec<u32> {
         for _ in 0..100_000 {
-            let delivered: Vec<u32> = self
-                .sink
-                .sends()
-                .iter()
-                .filter(|sent| sent.delivered)
-                .map(|sent| sent.ordinal)
-                .collect();
+            let delivered = self.sink.accepted();
             if delivered.len() >= count {
                 return delivered;
             }
@@ -574,6 +574,80 @@ impl Harness {
     }
 }
 
+#[derive(Debug, Default)]
+struct KeyOrder {
+    next: HashMap<u8, u32>,
+}
+
+impl KeyOrder {
+    fn from_first_events(keys: &[u8]) -> Self {
+        let mut next = HashMap::new();
+        for (ordinal, key) in keys.iter().enumerate() {
+            next.entry(*key).or_insert(u32::try_from(ordinal).unwrap());
+        }
+        Self { next }
+    }
+
+    fn batch(&mut self, batch: &[Sent], keys: &[u8]) -> Result<(), TestCaseError> {
+        let key_of = |sent: &Sent| keys[usize::try_from(sent.ordinal).unwrap()];
+        let mut seen = HashSet::new();
+        for run in batch.chunk_by(|left, right| key_of(left) == key_of(right)) {
+            let key = key_of(&run[0]);
+            prop_assert!(seen.insert(key), "key {key} is split within one batch");
+            let first = self.next.get(&key).copied().unwrap_or(run[0].ordinal);
+            let ordinals: Vec<u32> = run.iter().map(|sent| sent.ordinal).collect();
+            let expected: Vec<u32> = events_from(keys, key, first).take(run.len()).collect();
+            prop_assert_eq!(
+                &ordinals,
+                &expected,
+                "key {}: a batch must start at its lowest undelivered event and run consecutively",
+                key
+            );
+            let delivered = run.iter().take_while(|sent| sent.delivered).count();
+            let next = events_from(keys, key, first)
+                .nth(delivered)
+                .unwrap_or(u32::MAX);
+            self.next.insert(key, next);
+        }
+        Ok(())
+    }
+
+    fn discarded(&mut self, ordinal: u32, keys: &[u8]) {
+        let key = keys[usize::try_from(ordinal).unwrap()];
+        if self.next.get(&key) == Some(&ordinal) {
+            let next = events_from(keys, key, ordinal + 1)
+                .next()
+                .unwrap_or(u32::MAX);
+            self.next.insert(key, next);
+        }
+    }
+}
+
+fn accepted(batches: &[Vec<Sent>]) -> Vec<u32> {
+    batches
+        .iter()
+        .flat_map(|batch| batch.chunk_by(|left, right| left.key == right.key))
+        .flat_map(|run| {
+            run.iter()
+                .take_while(|sent| sent.delivered)
+                .map(|sent| sent.ordinal)
+        })
+        .collect()
+}
+
+fn events_from(keys: &[u8], key: u8, first: u32) -> impl Iterator<Item = u32> {
+    (first..u32::try_from(keys.len()).unwrap())
+        .filter(move |ordinal| keys[usize::try_from(*ordinal).unwrap()] == key)
+}
+
+fn check_order(batches: &[Vec<Sent>], keys: &[u8]) -> Result<(), TestCaseError> {
+    let mut order = KeyOrder::default();
+    for batch in batches {
+        order.batch(batch, keys)?;
+    }
+    Ok(())
+}
+
 fn three_keys_in_one_partition() -> Vec<Vec<u8>> {
     let mut by_partition: HashMap<u8, Vec<Vec<u8>>> = HashMap::new();
     for number in 0..4000 {
@@ -610,13 +684,90 @@ async fn delivers_distinct_keys_in_one_batch_and_settles_each_event_once() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn o2_events_of_one_key_are_sent_one_at_a_time_in_id_order() {
+async fn o2_consecutive_events_of_one_key_share_one_batch_in_id_order_and_settle_once_each() {
     let mut harness = Harness::new(1, 1, ScriptedSink::delivering()).await;
     for ordinal in 0..3 {
         harness.send(ordinal, b"same", 10).unwrap();
     }
     assert_eq!(harness.settle(3).await, Lsn(102));
-    assert_eq!(harness.sink.batches(), vec![vec![0], vec![1], vec![2]]);
+    assert_eq!(harness.sink.batches(), vec![vec![0, 1, 2]]);
+    assert_eq!(harness.ack.inflight_events(), 0);
+    assert!(harness.quiet_for(Duration::from_secs(1)).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_keys_run_is_capped_by_the_sink_message_and_byte_limits() {
+    let limits = SinkCapabilities {
+        max_batch_messages: 2,
+        ..LIMITS
+    };
+    let mut harness = Harness::new(
+        1,
+        1,
+        ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered)),
+    )
+    .await;
+    for ordinal in 0..5 {
+        harness.send(ordinal, b"same", 10).unwrap();
+    }
+    harness.settle(5).await;
+    assert_eq!(
+        harness.sink.batches(),
+        vec![vec![0, 1], vec![2, 3], vec![4]]
+    );
+
+    let limits = SinkCapabilities {
+        max_batch_bytes: 100,
+        ..LIMITS
+    };
+    let mut harness = Harness::new(
+        1,
+        1,
+        ScriptedSink::new(limits, Box::new(|_, _| Outcome::Delivered)),
+    )
+    .await;
+    for (ordinal, body) in [60, 40, 60, 30, 80].into_iter().enumerate() {
+        harness
+            .send(u32::try_from(ordinal).unwrap(), b"same", body)
+            .unwrap();
+    }
+    harness.settle(5).await;
+    assert_eq!(
+        harness.sink.batches(),
+        vec![vec![0, 1], vec![2, 3], vec![4]]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_batch_carries_each_keys_run_contiguously_in_ready_order() {
+    let mut harness = Harness::new(1, 1, ScriptedSink::delivering()).await;
+    for (ordinal, key) in [(0, b"a"), (1, b"b"), (2, b"a"), (3, b"a")] {
+        harness.send(ordinal, key, 10).unwrap();
+    }
+    assert_eq!(harness.settle(4).await, Lsn(103));
+    assert_eq!(harness.sink.batches(), vec![vec![0, 2, 3, 1]]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retryable_outcome_inside_a_run_resends_the_rest_of_the_run_in_order() {
+    let script: Script = Box::new(|ordinal, attempt| {
+        if ordinal == 1 && attempt == 1 {
+            Outcome::Retryable(SinkError("throttled".to_owned()))
+        } else {
+            Outcome::Delivered
+        }
+    });
+    let mut harness = Harness::new(1, 1, ScriptedSink::new(LIMITS, script)).await;
+    for ordinal in 0..3 {
+        harness.send(ordinal, b"same", 10).unwrap();
+    }
+    assert_eq!(harness.settle(1).await, Lsn(100));
+    assert!(harness.reports.try_recv().is_err());
+    assert_eq!(harness.sink.batches(), vec![vec![0, 1, 2]]);
+    assert_eq!(harness.settle(2).await, Lsn(102));
+    assert_eq!(harness.sink.batches(), vec![vec![0, 1, 2], vec![1, 2]]);
+    assert_eq!(harness.ack.inflight_events(), 0);
+    assert!(harness.quiet_for(Duration::from_secs(1)).await);
 }
 
 #[tokio::test(start_paused = true)]
@@ -751,15 +902,17 @@ async fn a_retryable_outcome_backs_off_only_its_key() {
         order,
         vec![
             (0, false),
+            (3, true),
             (1, true),
             (2, true),
             (0, false),
+            (3, true),
             (0, true),
             (3, true)
         ]
     );
-    assert!(sends[3].at - sends[0].at <= RETRY_BASE + LINGER);
-    assert!(sends[4].at - sends[3].at <= RETRY_BASE * 2 + LINGER);
+    assert!(sends[4].at - sends[0].at <= RETRY_BASE + LINGER);
+    assert!(sends[6].at - sends[4].at <= RETRY_BASE * 2 + LINGER);
 }
 
 #[tokio::test(start_paused = true)]
@@ -996,21 +1149,8 @@ proptest! {
             let last = Lsn(100 + u64::try_from(keys.len() - 1).unwrap());
             prop_assert_eq!(harness.settle(keys.len()).await, last);
             prop_assert_eq!(harness.ack.inflight_events(), 0);
-            let sends = harness.sink.sends();
-            let delivered = sends.iter().filter(|sent| sent.delivered).count();
-            prop_assert_eq!(delivered, keys.len());
-            for key in 0u8..5 {
-                let per_key: Vec<&Sent> = sends
-                    .iter()
-                    .filter(|sent| keys[usize::try_from(sent.ordinal).unwrap()] == key)
-                    .collect();
-                for pair in per_key.windows(2) {
-                    prop_assert!(pair[0].ordinal <= pair[1].ordinal);
-                    if pair[0].ordinal != pair[1].ordinal {
-                        prop_assert!(pair[0].delivered, "{} sent before {} was delivered", pair[1].ordinal, pair[0].ordinal);
-                    }
-                }
-            }
+            prop_assert_eq!(harness.sink.accepted().len(), keys.len());
+            check_order(&harness.sink.batches.lock().unwrap(), &keys)?;
             Ok(())
         })?;
     }

@@ -136,6 +136,39 @@ async fn batches_respect_the_message_and_byte_limits_and_an_entry_over_the_byte_
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_run_of_one_order_key_that_does_not_fit_the_call_moves_whole_to_the_next() {
+    let limits = SinkCapabilities {
+        max_batch_messages: 3,
+        ..LIMITS
+    };
+    let rig = Rig::new(limits, 1);
+    let first = rig.submit(vec![entry(0, b"z", 10)]);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let second = rig.submit(vec![
+        entry(1, b"x", 10),
+        entry(2, b"y", 10),
+        entry(3, b"y", 10),
+    ]);
+    first.await.unwrap();
+    assert_eq!(second.await.unwrap(), vec![Outcome::Delivered; 3]);
+    assert_eq!(rig.sink.batches(), vec![vec![0, 1], vec![2, 3]]);
+
+    let limits = SinkCapabilities {
+        max_batch_bytes: 100,
+        ..LIMITS
+    };
+    let rig = Rig::new(limits, 1);
+    rig.submit(vec![
+        entry(0, b"a", 40),
+        entry(1, b"b", 40),
+        entry(2, b"b", 40),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(rig.sink.batches(), vec![vec![0], vec![1, 2]]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_partial_batch_flushes_when_its_oldest_entry_has_waited_the_linger() {
     let rig = Rig::new(LIMITS, 1);
     let start = Instant::now();

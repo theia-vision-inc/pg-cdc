@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -14,6 +14,7 @@ use aws_sdk_sns::types::{MessageAttributeValue, PublishBatchRequestEntry};
 
 use crate::aws::{aws_loader, throttle_reason};
 use crate::metrics::{self, Measurement, ThrottleReason};
+use crate::order::OrderKeyId;
 
 use super::{AttributeValue, Outbound, Outcome, Sink, SinkCapabilities, SinkError};
 
@@ -23,9 +24,12 @@ pub const SNS_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const SNS_MAX_GROUP_ID_BYTES: usize = 128;
 pub const SNS_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
+const HELD_BACK: &str = "an earlier event of its order key was not delivered";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
     id: String,
+    order_key: OrderKeyId,
     message: String,
     attributes: Vec<(String, AttributeValue)>,
     group: Option<String>,
@@ -169,6 +173,7 @@ impl SnsSink {
         };
         Ok(Entry {
             id: index.to_string(),
+            order_key: outbound.order_key,
             message: message.to_owned(),
             attributes: outbound.attributes.clone(),
             group,
@@ -188,10 +193,22 @@ impl SnsSink {
                     "SNS rejected the batch as too long; sending its entries one at a time"
                 );
                 let mut outcomes = Vec::with_capacity(entries.len());
+                let mut held: HashSet<OrderKeyId> = HashSet::new();
                 for entry in entries {
+                    if held.contains(&entry.order_key) {
+                        if let Ok(index) = entry.id.parse::<usize>() {
+                            let error = SinkError(HELD_BACK.to_owned());
+                            outcomes.push((index, Outcome::Retryable(error)));
+                        }
+                        continue;
+                    }
                     let single = std::slice::from_ref(entry);
                     let result = self.api.publish_batch(&self.topic_arn, single).await;
-                    outcomes.extend(results(single, result));
+                    let sent = results(single, result);
+                    if !matches!(sent.as_slice(), [(_, Outcome::Delivered)]) {
+                        held.insert(entry.order_key);
+                    }
+                    outcomes.extend(sent);
                 }
                 outcomes
             }
@@ -902,6 +919,49 @@ mod tests {
             .map(|call| call.iter().map(|entry| entry.id.clone()).collect())
             .collect();
         assert_eq!(ids, vec![vec!["0", "1"], vec!["0"], vec!["1"]]);
+    }
+
+    #[tokio::test]
+    async fn one_at_a_time_a_failed_entry_holds_back_the_later_entries_of_its_order_key_only() {
+        let fake = FakeSns {
+            attributes: Some(topic(&[])),
+            ..FakeSns::default()
+        };
+        {
+            let mut responses = fake.responses.lock().unwrap();
+            responses.push_back(Err(PublishFailure::TooLong(
+                "BatchRequestTooLong".to_owned(),
+            )));
+            responses.push_back(Err(PublishFailure::Request(
+                "InternalError: try again".to_owned(),
+            )));
+        }
+        let (sink, fake) = preflighted(fake, None).await;
+        let other = Outbound {
+            order_key: OrderKeyId::of(b"[2]"),
+            ..outbound(2, "b")
+        };
+        let outcomes = sink
+            .send(&[outbound(0, "a"), outbound(1, "a"), other])
+            .await;
+        assert_eq!(
+            outcomes,
+            vec![
+                Outcome::Retryable(SinkError("InternalError: try again".to_owned())),
+                Outcome::Retryable(SinkError(
+                    "an earlier event of its order key was not delivered".to_owned()
+                )),
+                Outcome::Delivered,
+            ]
+        );
+        let ids: Vec<Vec<String>> = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.iter().map(|entry| entry.id.clone()).collect())
+            .collect();
+        assert_eq!(ids, vec![vec!["0", "1", "2"], vec!["0"], vec!["2"]]);
     }
 
     #[tokio::test]
