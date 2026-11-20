@@ -405,7 +405,7 @@ async fn o2_each_key_reaches_the_sink_in_id_order_across_lanes() -> TestResult {
 
 #[tokio::test]
 async fn a4_backpressure_pauses_reading_while_status_updates_keep_the_connection() -> TestResult {
-    const ROWS: usize = 30_000;
+    const ROWS: usize = 2_000;
     let pg = Postgres::start().await?;
     support::prepare(
         &pg,
@@ -423,7 +423,7 @@ async fn a4_backpressure_pauses_reading_while_status_updates_keep_the_connection
     let mut session = support::spawn_with(support::params(&pg), config);
     session.set_mode(Mode::Hold);
     pg.execute(&format!(
-        "INSERT INTO items SELECT g, repeat('x', 1000) FROM generate_series(1, {ROWS}) g"
+        "INSERT INTO items SELECT g, repeat('x', 100000) FROM generate_series(1, {ROWS}) g"
     ))
     .await?;
     let written = pg.current_wal_lsn().await?;
