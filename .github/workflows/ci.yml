@@ -30,6 +30,8 @@ jobs:
         with:
           version: 2026.10.9
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rustup toolchain install && rustup component add rustfmt clippy
       - run: mise run lint
       - run: mise run actionlint
@@ -47,6 +49,9 @@ jobs:
         with:
           version: 2026.10.9
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run test
 
   pg-matrix:
@@ -66,6 +71,9 @@ jobs:
         with:
           version: 2026.10.9
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run test-integration
 
   coverage:
@@ -79,6 +87,8 @@ jobs:
         with:
           version: 2026.10.9
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rustup toolchain install && rustup component add llvm-tools-preview
       - run: mise run cov
 
@@ -93,6 +103,8 @@ jobs:
         with:
           version: 2026.10.9
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run chaos-smoke
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
